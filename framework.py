@@ -128,10 +128,10 @@ class TextEncoder(nn.Module):
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
 
         HT = outputs.last_hidden_state  # (B, T, D_t)
-        return HT, attention_mask
+        Wemb = self.model.get_input_embeddings()(input_ids)  # (B, T, D_emb)
+        return HT, Wemb, attention_mask
 
 # =============================== Attention Blocks ============================
-
 class SimpleSelfAttentionBlock(nn.Module):
     """Lightweight self-attention for visual features"""
     def __init__(self, in_dim, hidden_dim, num_heads=8, dropout=0.1):
@@ -184,7 +184,6 @@ class CrossModalAttentionBlock(nn.Module):
         return self.norm(HV_proj + self.drop(attn_out))
 
 # ================================= CRD block =================================
-
 class ConditionalRelationDetector(nn.Module):
     def __init__(self, visual_dims=(2048,1536,1024), text_dim=768, hidden_dim=512, num_heads=8, dropout=0.1):
         """
@@ -261,6 +260,7 @@ class ConditionalRelationDetector(nn.Module):
             # HVi_triple_prime = self.post_proj[i](HVi_triple_prime)
             HV_triple_prime.append(HVi_triple_prime)
 
+        self.W_Vi = [self_block.proj for self_block in self.self_blocks]
         crd_logits = torch.stack(logits_list, dim=1)  # (B, 3, 2)
         crd_probs  = torch.stack(probs_list, dim=1)   # (B, 3, 2)
 
@@ -465,4 +465,79 @@ class VisualOpinionLearner(nn.Module):
 
         return {"boxes": boxes, "obj_mask": obj_mask, "classes": classes}
 
+# =============================== Multi-modal Sentiment Analyzer =================================
+class MultiModalSentimentAnalyzer(nn.Module):
+    """
+    MSA aligned to CORSA eq(11).
+    - Expects H_hats = [H1 (B,49,H), H2 (B,196,H), H3 (B,784,H)]
+    - E: text input embeddings (B, T_text, d_model) from the SAME BART embedding layer
+    - text_mask: (B, T_text) attention mask (1 valid, 0 pad)
+    - decoder_input_ids: (B, T_dec) shifted-right target ids (for teacher forcing)
+    """
+    def __init__(self, llm_model, hidden_dim=512, vocab_size=None):
+        super().__init__()
+        # llm_model: a HF seq2seq model (BartForConditionalGeneration or similar)
+        self.llm = llm_model
+        self.d_model = self.llm.config.d_model  # target dimension for encoder/decoder
+        if vocab_size is None:
+            vocab_size = self.llm.config.vocab_size
 
+        # WV2: map 196 tokens -> 49 tokens, WV3: map 784 -> 49 (linear across token axis).
+        self.WV2 = nn.Linear(196, 49)   # will be applied to HV2.transpose(1,2)
+        self.WV3 = nn.Linear(784, 49)
+
+        # fuse channel dims and project to d_model
+        self.fuse_proj = nn.Linear(hidden_dim * 3, self.d_model)  # (concatenated channels -> d_model)
+
+        # final token->vocab head
+        self.lm_head = nn.Linear(self.d_model, vocab_size, bias=True)
+
+        # loss
+        self.loss_fn = nn.CrossEntropyLoss(ignore_index=-100)  # -100 default ignore
+
+    def forward(self, H_hats, E, text_mask, decoder_input_ids, labels=None):
+        # H_hats: list of tensors with shapes [ (B,49,H), (B,196,H), (B,784,H) ]
+        HV1, HV2, HV3 = H_hats
+        B = HV1.size(0)
+
+        # map HV2 (B,196,H) -> (B,49,H)
+        # apply WV2 along token axis: transpose -> (B,H,196) -> linear -> (B,H,49) -> transpose back
+        HV2_49 = self.WV2(HV2.transpose(1,2)).transpose(1,2)  # (B,49,H)
+        HV3_49 = self.WV3(HV3.transpose(1,2)).transpose(1,2)  # (B,49,H)
+
+        # concat channels: (B,49, 3*H)
+        H_cat = torch.cat([HV1, HV2_49, HV3_49], dim=-1)
+
+        # project channels to d_model => (B,49,d_model)
+        H_vis = self.fuse_proj(H_cat)
+
+        # concatenate visual tokens with text embeddings along sequence dimension
+        # E is expected to be (B, T_text, d_model)
+        enc_inputs = torch.cat([H_vis, E], dim=1)  # (B, 49 + T_text, d_model)
+
+        # build encoder attention mask: 1 for visual tokens (all valid), then original text_mask
+        device = enc_inputs.device
+        vis_mask = torch.ones(B, H_vis.size(1), dtype=torch.long, device=device)
+        enc_attention_mask = torch.cat([vis_mask, text_mask], dim=1)  # (B, 49 + T_text)
+
+        # call encoder (pass inputs_embeds)
+        encoder_outputs = self.llm.model.encoder(inputs_embeds=enc_inputs,
+                                                 attention_mask=enc_attention_mask,
+                                                 return_dict=True)
+        encoder_hidden = encoder_outputs.last_hidden_state  # (B, seq_len_enc, d_model)
+
+        # call decoder with encoder_hidden_states (HuggingFace API)
+        decoder_outputs = self.llm.model.decoder(input_ids=decoder_input_ids,
+                                                 encoder_hidden_states=encoder_hidden,
+                                                 encoder_attention_mask=enc_attention_mask,
+                                                 return_dict=True)
+        decoder_hidden = decoder_outputs.last_hidden_state  # (B, T_dec, d_model)
+
+        logits = self.lm_head(decoder_hidden)  # (B, T_dec, vocab_size)
+
+        loss = None
+        if labels is not None:
+            # labels: (B, T_dec) with ignore_index=-100 for padded tokens
+            loss = self.loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
+
+        return logits, loss
