@@ -4,6 +4,8 @@ import torch.nn.functional as F
 from torchvision import models
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from ultralytics import YOLO
+from PIL import Image
+from torchvision import transforms
 
 # =============================== Encoders =================================
 class ImageEncoder(nn.Module):
@@ -370,40 +372,124 @@ class CORSA(nn.Module):
         }, msa_logits
 
 
+def build_inputs(image_paths, texts, aspects, sentiments,
+                 text_encoder, num_anchors=3, max_dec_len=10,
+                 device="cuda"):
+    """
+    Build a batch of inputs for CORSA.
+    
+    Args:
+        image_paths: list of image file paths
+        texts: list of text strings
+        aspects: list of aspect strings
+        sentiments: list of sentiment labels (e.g., "positive"/"negative"/"neutral")
+        text_encoder: instance of TextEncoder (to access tokenizer/model)
+        num_anchors: number of anchors per grid cell (default 3)
+        max_dec_len: max decoding length for MSA labels
+        device: "cuda" or "cpu"
+    
+    Returns:
+        images: (B,3,H,W) float tensor
+        texts: list of strings
+        aspects: list of strings
+        labels_crd: (B,3) int tensor
+        targets_vol: list of 3 dicts with detection targets
+        decoder_input_ids: (B,T_dec) int tensor
+        labels_msa: (B,T_dec) int tensor
+    """
+    B = len(image_paths)
+
+    # --- Image preprocessing ---
+    transform = transforms.Compose([
+        transforms.Resize((224,224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485,0.456,0.406],
+                             std=[0.229,0.224,0.225])
+    ])
+    imgs = [transform(Image.open(p).convert("RGB")) for p in image_paths]
+    images = torch.stack(imgs).to(device)
+
+    # --- CRD labels (dummy: all relevant) ---
+    labels_crd = torch.ones(B, 3, dtype=torch.long, device=device)
+
+    # --- VOL targets (dummy: empty detection, matching scales) ---
+    scales = [49, 196, 784]
+    targets_vol = []
+    for S in scales:
+        targets_vol.append({
+            "boxes": torch.zeros(B, S, num_anchors, 4, device=device),
+            "obj_mask": torch.zeros(B, S, num_anchors, device=device),
+            "classes": torch.zeros(B, S, num_anchors, dtype=torch.long, device=device)
+        })
+
+    # --- MSA decoder inputs & labels ---
+    # Convert sentiment into token sequence: e.g., "<aspect> is <sentiment>"
+    target_texts = [f"{a} is {s}" for a,s in zip(aspects, sentiments)]
+    enc = text_encoder.tokenizer(
+        target_texts,
+        padding="max_length", truncation=True, max_length=max_dec_len,
+        return_tensors="pt"
+    )
+    labels_msa = enc["input_ids"].to(device)
+    # decoder inputs are shifted right (standard seq2seq teacher forcing)
+    decoder_input_ids = text_encoder.model.prepare_decoder_input_ids_from_labels(labels_msa)
+
+    return images, texts, aspects, labels_crd, targets_vol, decoder_input_ids, labels_msa
+
 def demo_forward():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = CORSA(backbone="resnet50", text_model="facebook/bart-base").to(device)
 
-    B = 2
-    images = torch.randn(B, 3, 224, 224).to(device)
+    # === Dummy raw data ===
+    image_paths = ["sample1.jpg", "sample2.jpg"]  # must exist in working dir
     texts = ["this laptop has a good screen", "the camera quality is bad"]
     aspects = ["screen", "camera"]
+    sentiments = ["positive", "negative"]
 
-    # fake decoder inputs (teacher forcing) and labels
-    T_dec = 5
-    decoder_input_ids = torch.randint(0, model.text_encoder.model.config.vocab_size,
-                                      (B, T_dec), device=device)
-    labels_msa = torch.randint(0, model.text_encoder.model.config.vocab_size,
-                               (B, T_dec), device=device)
+    # === Build inputs ===
+    images, texts, aspects, labels_crd, targets_vol, decoder_input_ids, labels_msa = build_inputs(
+        image_paths, texts, aspects, sentiments, model.text_encoder, device=device
+    )
 
-    # fake CRD labels (all scales relevant)
-    labels_crd = torch.ones(B, 3, dtype=torch.long, device=device)
-
-    # fake VOL targets (empty dicts for now)
-    targets_vol = [{"boxes": torch.zeros(B,49,1,4,device=device),
-                    "obj_mask": torch.zeros(B,49,1,device=device),
-                    "classes": torch.zeros(B,49,1,dtype=torch.long,device=device)}
-                   for _ in range(3)]
-
+    # === Forward ===
     total_loss, losses, logits = model(
         images, texts, aspects,
         decoder_input_ids, labels_msa,
         labels_crd=labels_crd, targets_vol=targets_vol
     )
 
-    print("Total loss:", total_loss)
-    print("Loss dict:", {k: (v if v is None else float(v)) for k,v in losses.items()})
-    print("MSA logits shape:", logits.shape)
+    # === Predictions ===
+    pred_ids = torch.argmax(logits, dim=-1)   # (B, T_dec)
+    pred_texts = model.text_encoder.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+
+    predictions = {}
+    for asp, pred in zip(aspects, pred_texts):
+        tokens = pred.strip().split()
+        sentiment = tokens[-1] if len(tokens) >= 3 and tokens[-2] == "is" else "unknown"
+        predictions[asp] = sentiment
+
+    # --- Helper to safely detach nested loss dicts ---
+    def detach_loss(val):
+        if val is None:
+            return None
+        if isinstance(val, dict):
+            return {kk: detach_loss(vv) for kk, vv in val.items()}
+        if torch.is_tensor(val):
+            return float(val.detach().cpu())
+        return float(val)
+
+    loss_dict = {k: detach_loss(v) for k, v in losses.items()}
+
+    print("Total loss:", float(total_loss.detach().cpu()))
+    print("Loss dict:", loss_dict)
+    print("\nAspect-based Predictions:")
+    for asp, sent in predictions.items():
+        print(f"Aspect: {asp:10s} → Sentiment: {sent}")
+
+    return float(total_loss.detach().cpu()), loss_dict, predictions
+
+
+
 
 
 if __name__ == "__main__":
