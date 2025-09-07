@@ -6,6 +6,7 @@ from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from ultralytics import YOLO
 from PIL import Image
 from torchvision import transforms
+import json
 
 # =============================== Encoders =================================
 class ImageEncoder(nn.Module):
@@ -436,60 +437,70 @@ def build_inputs(image_paths, texts, aspects, sentiments,
 
     return images, texts, aspects, labels_crd, targets_vol, decoder_input_ids, labels_msa
 
-def demo_forward():
+def demo_forward(json_path="demo_data.json"):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = CORSA(backbone="resnet50", text_model="facebook/bart-base").to(device)
 
-    # === Dummy raw data ===
-    image_paths = ["sample1.jpg", "sample2.jpg"]  # must exist in working dir
-    texts = ["this laptop has a good screen", "the camera quality is bad"]
-    aspects = ["screen", "camera"]
-    sentiments = ["positive", "negative"]
+    # === Load JSON dataset ===
+    with open(json_path, "r") as f:
+        dataset = json.load(f)
 
-    # === Build inputs ===
-    images, texts, aspects, labels_crd, targets_vol, decoder_input_ids, labels_msa = build_inputs(
-        image_paths, texts, aspects, sentiments, model.text_encoder, device=device
-    )
+    total_losses, all_loss_dicts, all_predictions = [], [], []
 
-    # === Forward ===
-    total_loss, losses, logits = model(
-        images, texts, aspects,
-        decoder_input_ids, labels_msa,
-        labels_crd=labels_crd, targets_vol=targets_vol
-    )
+    for entry in dataset:
+        image_paths = [entry["image"]]          # list of image paths
+        texts = [entry["text"]]                 # list of review sentences
+        aspects = entry["aspects"]              # list of aspects
+        sentiments = entry["sentiments"]        # list of true sentiments
 
-    # === Predictions ===
-    pred_ids = torch.argmax(logits, dim=-1)   # (B, T_dec)
-    pred_texts = model.text_encoder.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+        # --- Build inputs ---
+        images, texts, aspects, labels_crd, targets_vol, decoder_input_ids, labels_msa = build_inputs(
+            image_paths, texts, aspects, sentiments, model.text_encoder, device=device
+        )
 
-    predictions = {}
-    for asp, pred in zip(aspects, pred_texts):
-        tokens = pred.strip().split()
-        sentiment = tokens[-1] if len(tokens) >= 3 and tokens[-2] == "is" else "unknown"
-        predictions[asp] = sentiment
+        # --- Forward pass ---
+        total_loss, losses, logits = model(
+            images, texts, aspects,
+            decoder_input_ids, labels_msa,
+            labels_crd=labels_crd, targets_vol=targets_vol
+        )
 
-    # --- Helper to safely detach nested loss dicts ---
-    def detach_loss(val):
-        if val is None:
-            return None
-        if isinstance(val, dict):
-            return {kk: detach_loss(vv) for kk, vv in val.items()}
-        if torch.is_tensor(val):
-            return float(val.detach().cpu())
-        return float(val)
+        # --- Decode predictions ---
+        pred_ids = torch.argmax(logits, dim=-1)   # (B, T_dec)
+        pred_texts = model.text_encoder.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
 
-    loss_dict = {k: detach_loss(v) for k, v in losses.items()}
+        predictions = {}
+        for asp, pred in zip(aspects, pred_texts):
+            tokens = pred.strip().split()
+            sentiment = tokens[-1] if len(tokens) >= 3 and tokens[-2] == "is" else "unknown"
+            predictions[asp] = sentiment
 
-    print("Total loss:", float(total_loss.detach().cpu()))
-    print("Loss dict:", loss_dict)
-    print("\nAspect-based Predictions:")
-    for asp, sent in predictions.items():
-        print(f"Aspect: {asp:10s} → Sentiment: {sent}")
+        # --- Helper to safely detach nested loss dicts ---
+        def detach_loss(val):
+            if val is None:
+                return None
+            if isinstance(val, dict):
+                return {kk: detach_loss(vv) for kk, vv in val.items()}
+            if torch.is_tensor(val):
+                return float(val.detach().cpu())
+            return float(val)
 
-    return float(total_loss.detach().cpu()), loss_dict, predictions
+        loss_dict = {k: detach_loss(v) for k, v in losses.items()}
 
+        # --- Collect results ---
+        total_losses.append(float(total_loss.detach().cpu()))
+        all_loss_dicts.append(loss_dict)
+        all_predictions.append(predictions)
 
+        # --- Print sample results ---
+        print(f"\n=== Sample ===")
+        print("Text:", entry["text"])
+        for asp, gt, pred in zip(entry["aspects"], entry["sentiments"], predictions.values()):
+            print(f"Aspect: {asp:10s} | GT: {gt:8s} | Pred: {pred}")
+        print("Loss dict:", loss_dict)
 
+    # Return all results
+    return total_losses, all_loss_dicts, all_predictions
 
 
 if __name__ == "__main__":
