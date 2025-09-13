@@ -280,17 +280,28 @@ class MultiModalSentimentAnalyzer(nn.Module):
         H_cat = torch.cat([HV1, HV2_49, HV3_49], dim=-1)
         H_vis = self.fuse_proj(H_cat)
 
-        enc_in = torch.cat([H_vis, E], dim=1)
-        vis_mask = torch.ones(H_vis.size(0), H_vis.size(1), device=E.device, dtype=torch.long)
-        enc_mask = torch.cat([vis_mask, text_mask], dim=1)
+        # Debug prints (optional)
+        # print("H_vis shape:", H_vis.shape)
+        # print("E shape:", E.shape)
+        # print("text_mask shape:", text_mask.shape)
+
+        # Use only text embeddings and mask for BART encoder
+        enc_in = E
+        enc_mask = text_mask
 
         enc_out = self.llm.model.encoder(inputs_embeds=enc_in,
                                          attention_mask=enc_mask,
                                          return_dict=True)
+        # print("encoder_hidden_state shape:", enc_out.last_hidden_state.shape)
+        # print("decoder_input_ids shape:", decoder_input_ids.shape)
+        # print("labels shape:", labels.shape if labels is not None else None)
+
         dec_out = self.llm.model.decoder(input_ids=decoder_input_ids,
                                          encoder_hidden_states=enc_out.last_hidden_state,
                                          encoder_attention_mask=enc_mask,
                                          return_dict=True)
+
+        # FIX: Compute logits from decoder output
         logits = self.lm_head(dec_out.last_hidden_state)
 
         loss = None
@@ -437,7 +448,7 @@ def build_inputs(image_paths, texts, aspects, sentiments,
 
     return images, texts, aspects, labels_crd, targets_vol, decoder_input_ids, labels_msa
 
-def demo_forward(json_path="demo_data/train_input.json"):
+def infer(json_path="demo_data/train_input.json"):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = CORSA(backbone="resnet50", text_model="facebook/bart-base").to(device)
 
@@ -450,10 +461,11 @@ def demo_forward(json_path="demo_data/train_input.json"):
     total_losses, all_loss_dicts, all_predictions = [], [], []
 
     for entry in dataset:
-        image_paths = [entry["image"]]          # list of image paths
-        texts = [entry["text"]]                 # list of review sentences
-        aspects = entry["aspects"]              # list of aspects
-        sentiments = entry["sentiments"]        # list of true sentiments
+        num_samples = len(entry["words"])
+        image_paths = [entry["image"]] * num_samples
+        texts = [entry["text"]] * num_samples
+        aspects = entry["words"]
+        sentiments = entry["sentiments"]       # list of true sentiments
 
         # --- Build inputs ---
         images, texts, aspects, labels_crd, targets_vol, decoder_input_ids, labels_msa = build_inputs(
@@ -466,6 +478,15 @@ def demo_forward(json_path="demo_data/train_input.json"):
             decoder_input_ids, labels_msa,
             labels_crd=labels_crd, targets_vol=targets_vol
         )
+
+        # --- Print CRD relevance scores ---
+        crd_logits, crd_probs, _, _ = model.crd(
+            model.image_encoder(images),
+            model.text_encoder(texts, aspects)[0],
+            text_mask=model.text_encoder(texts, aspects)[2]
+        )
+        print("CRD relevance scores (probs):")
+        print(crd_probs.detach().cpu().numpy())  # shape: (B, 3, 2), last dim: [not relevant, relevant]
 
         # --- Decode predictions ---
         pred_ids = torch.argmax(logits, dim=-1)   # (B, T_dec)
@@ -496,14 +517,13 @@ def demo_forward(json_path="demo_data/train_input.json"):
 
         # --- Print sample results ---
         print(f"\n=== Sample ===")
-        print("Text:", entry["text"])
+        print("Text:", entry["text"], "Words:", entry["words"])
         for asp, gt, pred in zip(aspects, entry["sentiments"], predictions.values()):
             print(f"Aspect: {asp:10s} | GT: {gt:8s} | Pred: {pred}")
         print("Loss dict:", loss_dict)
 
     # Return all results
     return total_losses, all_loss_dicts, all_predictions
-
 
 def train_and_save(model, train_json, num_epochs=1, save_path="corsa_trained.pt"):
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -514,41 +534,59 @@ def train_and_save(model, train_json, num_epochs=1, save_path="corsa_trained.pt"
             dataset.append(json.loads(line))
     model.train()
     for epoch in range(num_epochs):
+        print(f"\n=== Epoch {epoch+1}/{num_epochs} ===")
         for entry in dataset:
-            image_paths = [entry["image"]]
-            texts = [entry["text"]]
-            aspects = entry["aspects"]
+            num_samples = len(entry["words"])
+            image_paths = [entry["image"]] * num_samples
+            texts = [entry["text"]] * num_samples
+            aspects = entry["words"]
             sentiments = entry["sentiments"]
+
+                # Print label map for this entry
+            label_map = dict(zip(aspects, sentiments))
+            print("Input label map:", label_map)
+
             images, texts, aspects, labels_crd, targets_vol, decoder_input_ids, labels_msa = build_inputs(
                 image_paths, texts, aspects, sentiments, model.text_encoder, device=device
             )
             optimizer.zero_grad()
-            total_loss, _, _ = model(
+            total_loss, losses, _ = model(
                 images, texts, aspects,
                 decoder_input_ids, labels_msa,
                 labels_crd=labels_crd, targets_vol=targets_vol
             )
             total_loss.backward()
             optimizer.step()
+
+            # Print losses for each batch
+            def detach_loss(val):
+                if val is None:
+                    return None
+                if isinstance(val, dict):
+                    return {kk: detach_loss(vv) for kk, vv in val.items()}
+                if torch.is_tensor(val):
+                    return float(val.detach().cpu())
+                return float(val)
+            loss_dict = {k: detach_loss(v) for k, v in losses.items()}
+            print(f"Batch loss: {loss_dict}")
+
     torch.save(model.state_dict(), save_path)
     print(f"Model saved to {save_path}")
 
 def evaluate(model, json_path):
     model.eval()
     with torch.no_grad():
-        return demo_forward(json_path)
+        return infer(json_path)
 
 def run_all_splits():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = CORSA(backbone="resnet50", text_model="facebook/bart-base").to(device)
-    train_and_save(model, "demo_data/train_input_lite.json", num_epochs=1, save_path="corsa_trained.pt")
+    train_and_save(model, "demo_data/train_demo_lite.json", num_epochs=1, save_path="corsa_trained.pt")
     model.load_state_dict(torch.load("corsa_trained.pt", map_location=device))
     print("\n=== Evaluating on dev set ===")
-    evaluate(model, "demo_data/dev_input_lite.json")
+    evaluate(model, "demo_data/dev_demo_lite.json")
     print("\n=== Evaluating on test set ===")
-    evaluate(model, "demo_data/test_input_lite.json")
+    evaluate(model, "demo_data/test_demo_lite.json")
 
 if __name__ == "__main__":
     run_all_splits()
-# if __name__ == "__main__":
-#     demo_forward()
