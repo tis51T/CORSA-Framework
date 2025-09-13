@@ -437,13 +437,15 @@ def build_inputs(image_paths, texts, aspects, sentiments,
 
     return images, texts, aspects, labels_crd, targets_vol, decoder_input_ids, labels_msa
 
-def demo_forward(json_path="demo_data.json"):
+def demo_forward(json_path="demo_data/train_input.json"):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = CORSA(backbone="resnet50", text_model="facebook/bart-base").to(device)
 
     # === Load JSON dataset ===
-    with open(json_path, "r") as f:
-        dataset = json.load(f)
+    dataset = []
+    with open(json_path, "r", encoding="utf-8") as f:
+        for line in f:
+            dataset.append(json.loads(line))
 
     total_losses, all_loss_dicts, all_predictions = [], [], []
 
@@ -495,7 +497,7 @@ def demo_forward(json_path="demo_data.json"):
         # --- Print sample results ---
         print(f"\n=== Sample ===")
         print("Text:", entry["text"])
-        for asp, gt, pred in zip(entry["aspects"], entry["sentiments"], predictions.values()):
+        for asp, gt, pred in zip(aspects, entry["sentiments"], predictions.values()):
             print(f"Aspect: {asp:10s} | GT: {gt:8s} | Pred: {pred}")
         print("Loss dict:", loss_dict)
 
@@ -503,5 +505,50 @@ def demo_forward(json_path="demo_data.json"):
     return total_losses, all_loss_dicts, all_predictions
 
 
+def train_and_save(model, train_json, num_epochs=1, save_path="corsa_trained.pt"):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    dataset = []
+    with open(train_json, "r", encoding="utf-8") as f:
+        for line in f:
+            dataset.append(json.loads(line))
+    model.train()
+    for epoch in range(num_epochs):
+        for entry in dataset:
+            image_paths = [entry["image"]]
+            texts = [entry["text"]]
+            aspects = entry["aspects"]
+            sentiments = entry["sentiments"]
+            images, texts, aspects, labels_crd, targets_vol, decoder_input_ids, labels_msa = build_inputs(
+                image_paths, texts, aspects, sentiments, model.text_encoder, device=device
+            )
+            optimizer.zero_grad()
+            total_loss, _, _ = model(
+                images, texts, aspects,
+                decoder_input_ids, labels_msa,
+                labels_crd=labels_crd, targets_vol=targets_vol
+            )
+            total_loss.backward()
+            optimizer.step()
+    torch.save(model.state_dict(), save_path)
+    print(f"Model saved to {save_path}")
+
+def evaluate(model, json_path):
+    model.eval()
+    with torch.no_grad():
+        return demo_forward(json_path)
+
+def run_all_splits():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = CORSA(backbone="resnet50", text_model="facebook/bart-base").to(device)
+    train_and_save(model, "demo_data/train_input.json", num_epochs=1, save_path="corsa_trained.pt")
+    model.load_state_dict(torch.load("corsa_trained.pt", map_location=device))
+    print("\n=== Evaluating on dev set ===")
+    evaluate(model, "demo_data/dev_input.json")
+    print("\n=== Evaluating on test set ===")
+    evaluate(model, "demo_data/test_input.json")
+
 if __name__ == "__main__":
-    demo_forward()
+    run_all_splits()
+# if __name__ == "__main__":
+#     demo_forward()
