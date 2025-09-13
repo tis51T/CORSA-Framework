@@ -541,12 +541,12 @@ def evaluate(model, json_path):
 def run_all_splits():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = CORSA(backbone="resnet50", text_model="facebook/bart-base").to(device)
-    train_and_save(model, "demo_data/train_input.json", num_epochs=1, save_path="corsa_trained.pt")
+    train_and_save(model, "demo_data/train_input_lite.json", num_epochs=1, save_path="corsa_trained.pt")
     model.load_state_dict(torch.load("corsa_trained.pt", map_location=device))
     print("\n=== Evaluating on dev set ===")
-    evaluate(model, "demo_data/dev_input.json")
+    evaluate(model, "demo_data/dev_input_lite.json")
     print("\n=== Evaluating on test set ===")
-    evaluate(model, "demo_data/test_input.json")
+    evaluate(model, "demo_data/test_input_lite.json")
 
 if __name__ == "__main__":
     run_all_splits()

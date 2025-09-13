@@ -12,57 +12,59 @@ import json
 
 
 def main():
-    json_path = "./data/twitter_data/twitter2017_segmented/"
-    set_shapes = [30, 10, 10]
+    json_path = "./demo_data/"
+    set_shapes = [100, 10, 10]
 
     for i, set_type in enumerate(["train", "dev", "test"]):
-        df = pd.read_json(os.path.join(json_path, f"{set_type}.json"))
+        df = pd.read_json(os.path.join(json_path, f"{set_type}_input.json"), lines=True)
         df = df.sample(frac=1).reset_index(drop=True)  # Shuffle the DataFrame
 
         demo_df = df.head(set_shapes[i])
 
-        words = demo_df["words"].tolist()
-        aspects = demo_df["aspects"].tolist()
+        # words = demo_df["words"].tolist()
+        # aspects = demo_df["aspects"].tolist()
 
-        sentences = []
-        terms_list = []
+        # sentences = []
+        # terms_list = []
 
-        for j in range(len(words)):
-            sentence = " ".join(words[j])
-            sentences.append(sentence)
+        # for j in range(len(words)):
+        #     sentence = " ".join(words[j])
+        #     sentences.append(sentence)
 
-            terms = []
-            for k in range(len(aspects[j])):
-                terms.append(" ".join(aspects[j][k]["term"]))
-            terms_list.append(terms)
+        #     terms = []
+        #     for k in range(len(aspects[j])):
+        #         terms.append(" ".join(aspects[j][k]["term"]))
+        #     terms_list.append(terms)
 
-        outs = []
-        for j in range(len(terms_list)):
-            try:
-                genai_output = generate(sentence=sentences[j], terms=terms_list[j])
-                print(f"Sentence: {sentences[j]} - Terms: {terms_list[j]} - GenAI Output: {genai_output}")
-                outs.append(genai_output)
-            except Exception as e:
-                outs.append(None)
+        # outs = []
+        # for j in range(len(terms_list)):
+        #     try:
+        #         genai_output = generate(sentence=sentences[j], terms=terms_list[j])
+        #         print(f"Sentence: {sentences[j]} - Terms: {terms_list[j]} - GenAI Output: {genai_output}")
+        #         outs.append(genai_output)
+        #     except Exception as e:
+        #         outs.append(None)
 
-        demo_df["genai_output"] = outs
-        demo_df.to_json("./demo_data/" + f"{set_type}_demo.json", orient="records", lines=True)
+        # demo_df["genai_output"] = outs
+        # demo_df.to_json("./demo_data/" + f"{set_type}_demo.json", orient="records", lines=True)
 
-        image_idx = demo_df["image_id"].tolist()
+        image_idx = demo_df["image"].apply(lambda x: x.split("/")[-1]).tolist()
         
-        # for img_id in tqdm(image_idx, desc=f"Create demo for {set_type} set"):
-        #     # Read the source image
-        #     with open(f"./data/twitter_data/twitter2017_images/{img_id}", "rb") as img_file:
-        #         img_data = img_file.read()
+        for img_id in tqdm(image_idx, desc=f"Create demo for {set_type} set"):
+            # Read the source image
+            with open(f"./data/twitter_data/twitter2017_images/{img_id}", "rb") as img_file:
+                img_data = img_file.read()
 
-        #     # Create the destination directory if it doesn't exist
-        #     os.makedirs(f"./demo_data/images/{set_type}/", exist_ok=True)
+            # Create the destination directory if it doesn't exist
+            os.makedirs(f"./demo_data/images/", exist_ok=True)
 
-        #     # Write the image to the destination directory
-        #     with open(f"./demo_data/images/{set_type}/{img_id}", "wb") as demo_img_file:
-        #         demo_img_file.write(img_data)
+            # Write the image to the destination directory
+            with open(f"./demo_data/images/{img_id}", "wb") as demo_img_file:
+                demo_img_file.write(img_data)
         
-        # print(f"Saved {set_type} demo data with shape: {demo_df.shape}")
+        print(f"Saved {set_type} demo data with shape: {demo_df.shape}")
+        demo_df["image"] = demo_df["image"].apply(lambda x: x.replace(".\/twitter2017_images", ".\/demo_data\/images") )
+        demo_df.to_json("./demo_data/" + f"{set_type}_demo_lite.json", orient="records", lines=True)
 
 def generate(sentence, terms):
     client = genai.Client(
