@@ -1,113 +1,109 @@
 import pandas as pd
 import os
 from tqdm import tqdm
-# import base64
-# Google Generative AI SDK
-import base64
-from google import genai
-from google.genai import types
-
-
 import json
+import re
 
+FOLDER_PATH = "./demo_data/"
 
-def main():
-    json_path = "./demo_data/"
-    set_shapes = [100, 10, 10]
+def turn_back_to_json(ai_response):
+    if isinstance(ai_response, dict):
+        return ai_response
+    if not isinstance(ai_response, str):
+        return None
+    match = re.search(r'```(?:json)?(.*?)```', ai_response, re.DOTALL)
+    if match:
+        ai_response = match.group(1).strip()
+    else:
+        ai_response = ai_response.strip('`').strip()
+    try:
+        return json.loads(ai_response)
+    except json.JSONDecodeError as e:
+        print("JSON decode error:", e)
+        return None
 
-    for i, set_type in enumerate(["train", "dev", "test"]):
-        df = pd.read_json(os.path.join(json_path, f"{set_type}_input.json"), lines=True)
-        df = df.sample(frac=1).reset_index(drop=True)  # Shuffle the DataFrame
+def encode_polarity(p):
+    return "positive" if p == "POS" else "negative" if p == "NEG" else "neutral"
 
-        demo_df = df.head(set_shapes[i])
+def encode_type(t):
+    return "person" if t == "[PER]" else "location" if t == "[LOC]" else "other"
 
-        # words = demo_df["words"].tolist()
-        # aspects = demo_df["aspects"].tolist()
+def process_aspects(df):
+    # Convert genai_out to dict if needed
+    df["genai_out"] = df["genai_out"].apply(turn_back_to_json)
+    df.dropna(subset=["genai_out"], inplace=True)
 
-        # sentences = []
-        # terms_list = []
-
-        # for j in range(len(words)):
-        #     sentence = " ".join(words[j])
-        #     sentences.append(sentence)
-
-        #     terms = []
-        #     for k in range(len(aspects[j])):
-        #         terms.append(" ".join(aspects[j][k]["term"]))
-        #     terms_list.append(terms)
-
-        # outs = []
-        # for j in range(len(terms_list)):
-        #     try:
-        #         genai_output = generate(sentence=sentences[j], terms=terms_list[j])
-        #         print(f"Sentence: {sentences[j]} - Terms: {terms_list[j]} - GenAI Output: {genai_output}")
-        #         outs.append(genai_output)
-        #     except Exception as e:
-        #         outs.append(None)
-
-        # demo_df["genai_output"] = outs
-        # demo_df.to_json("./demo_data/" + f"{set_type}_demo.json", orient="records", lines=True)
-
-        image_idx = demo_df["image"].apply(lambda x: x.split("/")[-1]).tolist()
-        
-        for img_id in tqdm(image_idx, desc=f"Create demo for {set_type} set"):
-            # Read the source image
-            with open(f"./data/twitter_data/twitter2017_images/{img_id}", "rb") as img_file:
-                img_data = img_file.read()
-
-            # Create the destination directory if it doesn't exist
-            os.makedirs(f"./demo_data/images/", exist_ok=True)
-
-            # Write the image to the destination directory
-            with open(f"./demo_data/images/{img_id}", "wb") as demo_img_file:
-                demo_img_file.write(img_data)
-        
-        print(f"Saved {set_type} demo data with shape: {demo_df.shape}")
-        demo_df["image"] = demo_df["image"].apply(lambda x: x.replace(".\/twitter2017_images", ".\/demo_data\/images") )
-        demo_df.to_json("./demo_data/" + f"{set_type}_demo_lite.json", orient="records", lines=True)
-
-def generate(sentence, terms):
-    client = genai.Client(
-        api_key="AIzaSyBTjcqmChEUS6jxMglJPowgJnDXHvLZMto",
-    )
-
-    full_prompt = f"""
-    Expect you are a data labeler, I will give you a sentence and terms in sentence. Your task is classifying these terms into three aspect: [PER] for person, [LOC] for location, and [OTH] for other things. Your output must be followed these constraints:
-        - Return only one label, no reasoning
-        - Output format: 'label': [PER]/[PLACE]/[THING]; and being dictionary format
-
-        Input: 
-            "sentence": {sentence}, 
-            "terms":{terms}
-            
-        Output:
-    """
-
-    model = "gemini-2.0-flash"
-    contents = [
-        types.Content(
-            role="user",
-            parts=[
-                types.Part.from_text(text=full_prompt),
-            ],
-        ),
+    # Build aspect/polarity/type merged list
+    new_aspects_list = [
+    {
+        " ".join(a["term"]) if isinstance(a, dict) and "term" in a else str(a): 
+        a["polarity"] if isinstance(a, dict) and "polarity" in a else None
+        for a in aspects if isinstance(a, dict) or isinstance(a, str)
+    }
+    for aspects in df["aspects"]
+]
+    merged_aspects_list = [
+        [
+            { key: [encode_polarity(new_aspects.get(key)), encode_type(genai_out.get(key))] }
+            for key in set(new_aspects.keys()) | set(genai_out.keys())
+        ]
+        for new_aspects, genai_out in zip(new_aspects_list, df["genai_out"])
     ]
-    generate_content_config = types.GenerateContentConfig(
-    )
+    df["label_aspects"] = merged_aspects_list
 
-    full_text = ""
-    for chunk in client.models.generate_content_stream(
-        model=model,
-        contents=contents,
-        config=generate_content_config,
-    ):
-        # print(chunk.text, end="")
-        full_text += chunk.text
+    # Build words, aspects, sentiments columns
+    words, aspects, sentiments = [], [], []
+    for item in merged_aspects_list:
+        temp_w, temp_a, temp_s = [], [], []
+        for aspect in item:
+            for key, (sent, asp) in aspect.items():
+                temp_w.append(key)
+                temp_s.append(sent)
+                temp_a.append(asp)
+        words.append(temp_w)
+        sentiments.append(temp_s)
+        aspects.append(temp_a)
 
-    return full_text
+    # Build new DataFrame
+    new_df = pd.DataFrame({
+        "text": df["words"].apply(lambda x: " ".join(x)),
+        "image": df["image_id"].apply(lambda x: f"./twitter2017_images/{x}"),
+        "words": words,
+        "aspects": aspects,
+        "sentiments": sentiments
+    })
+    return new_df
+
+def create_dataset(version="full"):
+    set_shapes = [100, 10, 10]
+    for i, set_type in enumerate(["train", "dev", "test"]):
+        # Load raw data and process aspects
+        df = pd.read_json(os.path.join(FOLDER_PATH, f"{set_type}.json"))
+        new_df = process_aspects(df)
+        new_df = new_df.sample(frac=1).reset_index(drop=True)  # Shuffle
+
+        # Select demo subset if needed
+        if version == "demo":
+            demo_df = new_df.head(set_shapes[i]).copy()
+        else:
+            demo_df = new_df.copy()
+
+        # Copy images to demo folder
+        image_idx = demo_df["image"].apply(lambda x: x.split("/")[-1]).tolist()
+    
+        for img_id in tqdm(image_idx, desc=f"Create demo for {set_type} set"):
+            src_img = f"./data/twitter_data/twitter2017_images/{img_id}"
+            dst_img = f"./demo_data/images/{img_id}"
+            os.makedirs(os.path.dirname(dst_img), exist_ok=True)
+            with open(src_img, "rb") as img_file:
+                img_data = img_file.read()
+            with open(dst_img, "wb") as demo_img_file:
+                demo_img_file.write(img_data)
+
+        demo_df["image"] = demo_df["image"].apply(lambda x: x.replace("./twitter2017_images", "./demo_data/images"))
+        outpath = os.path.join(FOLDER_PATH, f"{set_type}_labeled_{version}.json")
+        print(f"Saving to {outpath}")
+        demo_df.to_json(outpath, orient="records", lines=True)
 
 if __name__ == "__main__":
-    main()
-
-# if __name__ == "__main__":
-#     main()
+    create_dataset(version="demo")

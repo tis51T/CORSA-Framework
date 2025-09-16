@@ -6,3 +6,5 @@
 
 # Thêm NOTE
 - Tự tìm model NER
+- Thêm báo cáo mô hình
+- Xử lý vấn đề đa hình ảnh

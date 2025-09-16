@@ -2,18 +2,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from ultralytics import YOLO
-from ultralytics.nn.tasks import DetectionModel
+from PIL import Image
+from torchvision import transforms
+import json
 
 # =============================== Encoders =================================
 class ImageEncoder(nn.Module):
     """
     Unified image encoder abstraction:
+    - ResNet backbone (multi-scale conv features)
+    - ViT backbone (patch embeddings projected)
     - YOLOv8 backbone (multi-scale conv features)
-    - ResNet backbone (pooled + projected multi-scale features)
-    - ViT backbone (patch embeddings projected to YOLO-like dims)
-    Always returns: [HV1, HV2, HV3] as (B, S, D)
+    Always returns: [HV1, HV2, HV3] with shapes:
+      HV1: (B, 49, D1)
+      HV2: (B, 196, D2)
+      HV3: (B, 784, D3)
     """
     def __init__(self, backbone="resnet50", pretrained=True):
         super().__init__()
@@ -21,16 +26,11 @@ class ImageEncoder(nn.Module):
         self.out_dims = [2048, 1536, 1024]
 
         if self.backbone.startswith("resnet"):
-            # safer resnet weights selection
-            if pretrained:
-                weights = models.ResNet50_Weights.IMAGENET1K_V1 if self.backbone == "resnet50" else None
-                resnet = models.resnet50(weights=weights)
-            else:
-                resnet = models.resnet50(weights=None)
+            resnet = models.resnet50(
+                weights=models.ResNet50_Weights.IMAGENET1K_V1 if pretrained else None
+            )
             modules = list(resnet.children())[:-2]
             self.encoder = nn.Sequential(*modules)
-
-            # project to YOLO-like dims
             self.proj2 = nn.Linear(2048, 1536)
             self.proj3 = nn.Linear(2048, 1024)
 
@@ -40,504 +40,553 @@ class ImageEncoder(nn.Module):
             )
             vit.heads = nn.Identity()
             self.encoder = vit
-
-            # project 768 → YOLO-like dims
             self.proj1 = nn.Linear(768, 2048)
             self.proj2 = nn.Linear(768, 1536)
             self.proj3 = nn.Linear(768, 1024)
 
         elif self.backbone.startswith("yolov8"):
             self.encoder = YOLO(f"{self.backbone}.pt").model.backbone
-            self.proj1 = nn.Linear(256, 2048)   # deepest scale → 2048
-            self.proj2 = nn.Linear(128, 1536)   # mid scale   → 1536
-            self.proj3 = nn.Linear(64, 1024)    # shallow     → 1024
+            self.proj1, self.proj2, self.proj3 = None, None, None  # will be built dynamically
 
         else:
             raise ValueError(f"Unsupported backbone: {backbone}")
 
     def forward(self, images):
         if self.backbone.startswith("resnet"):
-            feature_map = self.encoder(images)  # (B, 2048, W/32, H/32)
+            fmap = self.encoder(images)  # (B, 2048, H/32, W/32)
 
-            hv1 = F.adaptive_avg_pool2d(feature_map, (7, 7)).flatten(2).transpose(1, 2)
-            hv2 = F.adaptive_avg_pool2d(feature_map, (14, 14)).flatten(2).transpose(1, 2)
-            hv2 = self.proj2(hv2)
-            hv3 = F.adaptive_avg_pool2d(feature_map, (28, 28)).flatten(2).transpose(1, 2)
-            hv3 = self.proj3(hv3)
-
+            hv1 = F.adaptive_avg_pool2d(fmap, (7, 7)).flatten(2).transpose(1, 2)
+            hv2 = self.proj2(
+                F.adaptive_avg_pool2d(fmap, (14, 14)).flatten(2).transpose(1, 2)
+            )
+            hv3 = self.proj3(
+                F.adaptive_avg_pool2d(fmap, (28, 28)).flatten(2).transpose(1, 2)
+            )
             return [hv1, hv2, hv3]
 
         elif self.backbone == "vit_b_16":
             patch_tokens = self.encoder._process_input(images)  # (B, N, 768)
-            B, S, D = patch_tokens.shape
-
-            hv1 = patch_tokens[:, :49, :]
-            hv2 = patch_tokens[:, :196, :]
-            hv3 = patch_tokens[:, :784, :]
-
-            hv1 = self.proj1(hv1)
-            hv2 = self.proj2(hv2)
-            hv3 = self.proj3(hv3)
-
+            hv1 = self.proj1(patch_tokens[:, :49, :])
+            hv2 = self.proj2(patch_tokens[:, :196, :])
+            hv3 = self.proj3(patch_tokens[:, :784, :])
             return [hv1, hv2, hv3]
 
         elif self.backbone.startswith("yolov8"):
-            features = self.encoder(images)  # list of feature maps
-            f1 = features[2]   # deeper feature map
-            hv1 = f1.flatten(2).transpose(1, 2)  # (B, S, C)
-            hv1 = self.proj1(hv1)
+            feats = self.encoder(images)  # list of feature maps
+            # build proj layers dynamically if first call
+            if self.proj1 is None:
+                c1, c2, c3 = feats[2].shape[1], feats[1].shape[1], feats[0].shape[1]
+                self.proj1 = nn.Linear(c1, 2048).to(feats[2].device)
+                self.proj2 = nn.Linear(c2, 1536).to(feats[1].device)
+                self.proj3 = nn.Linear(c3, 1024).to(feats[0].device)
 
-            # HV2: mid map (14x14 → 196 tokens), project → 1536
-            f2 = features[1]
-            hv2 = f2.flatten(2).transpose(1, 2)
-            hv2 = self.proj2(hv2)
-
-            # HV3: largest map (28x28 → 784 tokens), project → 1024
-            f3 = features[0]
-            hv3 = f3.flatten(2).transpose(1, 2)
-            hv3 = self.proj3(hv3)
-
+            hv1 = self.proj1(feats[2].flatten(2).transpose(1, 2))
+            hv2 = self.proj2(feats[1].flatten(2).transpose(1, 2))
+            hv3 = self.proj3(feats[0].flatten(2).transpose(1, 2))
             return [hv1, hv2, hv3]
+
 
 class TextEncoder(nn.Module):
     """
-    Wrapper for HuggingFace transformer encoder (BERT, BART, RoBERTa, etc.)
-    Outputs contextual embeddings for tokens.
+    Wraps a HuggingFace seq2seq model (e.g., BART).
+    Returns contextual embeddings (HT), input embeddings (E), and mask.
     """
-    def __init__(self, model_name="bert-base-uncased", max_length=128):
+    def __init__(self, model_name="facebook/bart-base", max_length=128):
         super().__init__()
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-        self.model = AutoModel.from_pretrained(model_name)
-        self.hidden_size = self.model.config.hidden_size
+        self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+        self.hidden_size = self.model.config.d_model
         self.max_length = max_length
 
     def forward(self, texts, aspects):
-        """
-        Args:
-            texts: list of strings
-            aspects: list of aspect terms (strings)
-        Returns:
-            HT: tensor (B, T, D_t)
-            mask: attention mask (B, T)
-        """
-        # Aspect-aware encoding: prepend aspect
-        joint_texts = [f"{a} {self.tokenizer.sep_token} {t}" for a,t in zip(aspects, texts)]
-        enc = self.tokenizer(joint_texts, ..., return_tensors="pt")
-        input_ids = enc["input_ids"].to(self.model.device)
-        attention_mask = enc["attention_mask"].to(self.model.device)
-        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+        # prepend aspect for aspect-aware input
+        joint = [f"{a} {self.tokenizer.sep_token} {t}" for a, t in zip(aspects, texts)]
+        enc = self.tokenizer(
+            joint, padding=True, truncation=True, max_length=self.max_length,
+            return_tensors="pt"
+        )
+        input_ids, mask = enc["input_ids"].to(self.model.device), enc["attention_mask"].to(self.model.device)
 
-        HT = outputs.last_hidden_state  # (B, T, D_t)
-        Wemb = self.model.get_input_embeddings()(input_ids)  # (B, T, D_emb)
-        return HT, Wemb, attention_mask
+        outputs = self.model.model.encoder(input_ids=input_ids, attention_mask=mask, return_dict=True)
+        HT = outputs.last_hidden_state  # contextual features (B, T, d_model)
+
+        E = self.model.model.shared(input_ids)  # embeddings (B, T, d_model)
+
+        return HT, E, mask
 
 # =============================== Attention Blocks ============================
 class SimpleSelfAttentionBlock(nn.Module):
-    """Lightweight self-attention for visual features"""
     def __init__(self, in_dim, hidden_dim, num_heads=8, dropout=0.1):
         super().__init__()
-        self.proj = nn.Linear(in_dim, hidden_dim) # WVi
-        self.attn = nn.MultiheadAttention(embed_dim=hidden_dim,
-                                          num_heads=num_heads,
-                                          batch_first=True)
+        self.proj = nn.Linear(in_dim, hidden_dim)
+        self.attn = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
         self.norm = nn.LayerNorm(hidden_dim)
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x):
-        # x: (B, S, D_in)
-        x_proj = self.proj(x)  # (B, S, hidden_dim)
+        x_proj = self.proj(x)
         attn_out, _ = self.attn(x_proj, x_proj, x_proj)
-        # may be have FFN here
         return self.norm(x_proj + self.drop(attn_out))
 
+
 class CrossModalAttentionBlock(nn.Module):
-    """Cross-modal attention: visual queries attend to text keys/values"""
     def __init__(self, v_dim, t_dim, hidden_dim, num_heads=8, dropout=0.1):
         super().__init__()
         self.v_proj = nn.Linear(v_dim, hidden_dim)
         self.t_proj = nn.Linear(t_dim, hidden_dim)
-        self.attn = nn.MultiheadAttention(embed_dim=hidden_dim,
-                                          num_heads=num_heads,
-                                          batch_first=True)
+        self.attn = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
         self.norm = nn.LayerNorm(hidden_dim)
         self.drop = nn.Dropout(dropout)
 
     def forward(self, HV, HT, text_mask=None):
-        """
-        HV: (B, Sv, Dv) visual features
-        HT: (B, St, Dt) text features
-        text_mask: (B, St) with 1=valid, 0=pad
-        """
-        HV_proj = self.v_proj(HV)
-        HT_proj = self.t_proj(HT)
+        HVp, HTp = self.v_proj(HV), self.t_proj(HT)
+        key_padding_mask = (text_mask == 0) if text_mask is not None else None
+        attn_out, _ = self.attn(HVp, HTp, HTp, key_padding_mask=key_padding_mask)
+        return self.norm(HVp + self.drop(attn_out))
 
-        # convert HuggingFace attention_mask → key_padding_mask
-        # key_padding_mask: True = ignore, False = keep
-        key_padding_mask = None
-        if text_mask is not None:
-            key_padding_mask = (text_mask == 0)  # invert
-
-        attn_out, _ = self.attn(query=HV_proj,
-                                key=HT_proj,
-                                value=HT_proj,
-                                key_padding_mask=key_padding_mask)
-        return self.norm(HV_proj + self.drop(attn_out))
-
-# ================================= CRD block =================================
+# =============================== CRD =========================================
 class ConditionalRelationDetector(nn.Module):
-    def __init__(self, visual_dims=(2048,1536,1024), text_dim=768, hidden_dim=512, num_heads=8, dropout=0.1):
-        """
-        Args:
-            visual_dims: list of 3 ints [Dv1, Dv2, Dv3]
-            text_dim: int (Dt, dimension of text features)
-            hidden_dim: internal hidden dim
-        """
+    def __init__(self, visual_dims=(2048,1536,1024), text_dim=768, hidden_dim=512):
         super().__init__()
-        assert len(visual_dims) == 3, "Expect three visual scales."
-
         self.num_scales = 3
+        self.self_blocks = nn.ModuleList([SimpleSelfAttentionBlock(d, hidden_dim) for d in visual_dims])
+        self.cross_blocks = nn.ModuleList([CrossModalAttentionBlock(hidden_dim, text_dim, hidden_dim) for _ in range(3)])
+        self.class_heads = nn.ModuleList([nn.Linear(hidden_dim, 2) for _ in range(3)])
+        self.loss_fn = nn.CrossEntropyLoss()
 
-        # (1) self-attention blocks (visual only)
-        self.self_blocks = nn.ModuleList([
-            SimpleSelfAttentionBlock(in_dim=d, hidden_dim=hidden_dim, num_heads=num_heads,  dropout=dropout)
-            for d in visual_dims
-        ])
-
-        # (2) cross-modal attention blocks (visual ↔ text)
-        self.cross_blocks = nn.ModuleList([
-            CrossModalAttentionBlock(v_dim=hidden_dim,
-                                     t_dim=text_dim,
-                                     hidden_dim=hidden_dim,
-                                     num_heads=num_heads,
-                                     dropout=dropout)
-            for _ in range(3)
-        ])
-
-        # (4) classification heads (relevant / irrelevant)
-        self.class_heads = nn.ModuleList([
-            nn.Linear(hidden_dim, 2) for _ in range(3)
-        ])
-
-        # # (5) project back
-        # self.post_proj = nn.ModuleList([
-        #     nn.Linear(hidden_dim, d) for d in visual_dims
-        # ])
-
-    def forward(self, visuals, text_features, text_mask=None):
-        """
-        Args:
-            visuals: list [HV1, HV2, HV3] with shapes [(B, S1, Dv1), ...]
-            text_features: (B, T, Dt)
-            text_mask: (B, T) where 1=valid, 0=pad
-
-        Returns:
-            crd_logits: (B, 3, 2) logits for relevance
-            crd_probs: (B, 3, 2) softmax probs
-            filtered_visuals: list of filtered visuals [H'''_V1, H'''_V2, H'''_V3]
-        """
-        B = text_features.size(0)
-        logits_list, probs_list, HV_triple_prime = [], [], []
+    def forward(self, visuals, text_features, text_mask=None, labels_crd=None):
+        logits_list, probs_list, filtered = [], [], []
 
         for i in range(self.num_scales):
-            HVi = visuals[i]  # (B, Si, Dvi)
-            # (1) self-attention → hidden_dim
-            HVi_prime = self.self_blocks[i](HVi)  
-            # (2) cross-modal attention with text
-            HVi_double_prime = self.cross_blocks[i](HVi_prime, text_features, text_mask=text_mask)
-            # (3) max-pool across sequence (Si)
-            HVi_max, _ = torch.max(HVi_double_prime, dim=1)  # (B, hidden_dim)
-            # (4) classify
-            logits = self.class_heads[i](HVi_max)          # (B, 2)
-            probs = F.softmax(logits, dim=-1)           # (B, 2)
-            # (5) filter matrix Gi using relevant prob
-            prob_relevant = probs[:, 1].unsqueeze(-1).unsqueeze(-1)  # (B,1,1)
-            Gi = prob_relevant.expand(-1, HVi_double_prime.size(1), HVi_double_prime.size(2))  # (B,Si,H)
-            HVi_triple_prime  = Gi * HVi_double_prime  # (B, Si, H) filtered features
+            HVi = visuals[i]
+            HVi1 = self.self_blocks[i](HVi)
+            HVi2 = self.cross_blocks[i](HVi1, text_features, text_mask)
+            Hmax, _ = torch.max(HVi2, dim=1)
+            logits = self.class_heads[i](Hmax)
+            probs = F.softmax(logits, dim=-1)
+
+            Gi = probs[:,1].unsqueeze(-1).unsqueeze(-1).expand_as(HVi2)
+            HVi3 = Gi * HVi2
+
             logits_list.append(logits)
             probs_list.append(probs)
+            filtered.append(HVi3)
 
-            # # (6) optional: project back to original dim
-            # HVi_triple_prime = self.post_proj[i](HVi_triple_prime)
-            HV_triple_prime.append(HVi_triple_prime)
+        crd_logits = torch.stack(logits_list, dim=1)  # (B,3,2)
+        crd_probs  = torch.stack(probs_list, dim=1)
 
-        self.W_Vi = [self_block.proj for self_block in self.self_blocks]
-        crd_logits = torch.stack(logits_list, dim=1)  # (B, 3, 2)
-        crd_probs  = torch.stack(probs_list, dim=1)   # (B, 3, 2)
+        loss_crd = None
+        if labels_crd is not None:
+            loss_crd = self.loss_fn(crd_logits.view(-1,2), labels_crd.view(-1))
 
-        # make sure no zero probabilities to avoid log(0)
-        relevant_probs = crd_probs[:, :, 1]  # shape: (B, 3)
+        return crd_logits, crd_probs, filtered, loss_crd
 
-        # clamp to avoid log(0)
-        eps = 1e-12
-        relevant_probs = relevant_probs.clamp(min=eps)
-
-        # compute log
-        log_probs = torch.log(relevant_probs)  # (B, 3)
-
-        # sum over scales i=1..3
-        sum_log = log_probs.sum(dim=1)  # (B,)
-
-        # average over batch and negate
-        loss_crd = -sum_log.mean()
-
-        return crd_logits, loss_crd, HV_triple_prime
-
-# ================================= VOL block =================================
+# =============================== VOL =========================================
 class DetectHead(nn.Module):
-    """
-    Simple detection head for VOL when using ResNet or ViT as image encoder.
-    Input: (B, S, D)
-    Output: dict with boxes, objectness, class_logits
-    """
     def __init__(self, in_dim, hidden_dim=256, num_classes=3, num_anchors=3):
         super().__init__()
-        self.num_classes = num_classes
-        self.num_anchors = num_anchors
-
         self.fc = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.ReLU(),
+            nn.Linear(in_dim, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, num_anchors * (4 + 1 + num_classes))
         )
+        self.num_anchors, self.num_classes = num_anchors, num_classes
 
     def forward(self, x):
-        """
-        x: (B, S, D)
-        returns:
-          - boxes: (B, S, A, 4)
-          - obj_logits: (B, S, A)
-          - class_logits: (B, S, A, C)
-        """
         B, S, D = x.shape
-        out = self.fc(x)  # (B, S, A*(4+1+C))
-        out = out.view(B, S, self.num_anchors, 4 + 1 + self.num_classes)
-
-        boxes = out[..., :4]          # (B, S, A, 4)
-        obj_logits = out[..., 4]      # (B, S, A)
-        class_logits = out[..., 5:]   # (B, S, A, C)
-
+        out = self.fc(x).view(B, S, self.num_anchors, 4+1+self.num_classes)
         return {
-            "boxes": boxes, "obj_logits": obj_logits, "class_logits": class_logits
+            "boxes": out[..., :4],
+            "obj_logits": out[..., 4],
+            "class_logits": out[..., 5:]
         }
 
+
 class VOLLoss(nn.Module):
-    """
-    Implements L_LOC and L_CLS from the paper.
-    """
-    def __init__(self):
-        super().__init__()
-        self.loc_loss = nn.MSELoss(reduction="none")
-        self.cls_loss = nn.CrossEntropyLoss(reduction="none")
-        self.obj_loss = nn.BCEWithLogitsLoss(reduction="none")
-
+    def __init__(self): super().__init__()
     def forward(self, preds, targets):
-        """
-        preds: dict from SimpleDETHead
-        targets: dict with keys:
-            - boxes: (B, S, A, 4)
-            - obj_mask: (B, S, A) 0/1
-            - classes: (B, S, A) long
-        """
-        pred_boxes = preds["boxes"]
-        pred_obj = preds["obj_logits"]
-        pred_cls = preds["class_logits"]
+        loc_loss = nn.MSELoss(reduction="none")
+        cls_loss = nn.CrossEntropyLoss(reduction="none")
+        obj_loss = nn.BCEWithLogitsLoss(reduction="none")
 
-        gt_boxes = targets["boxes"]
-        gt_obj = targets["obj_mask"]
-        gt_cls = targets["classes"]
+        pb, po, pc = preds["boxes"], preds["obj_logits"], preds["class_logits"]
+        gb, go, gc = targets["boxes"], targets["obj_mask"], targets["classes"]
 
-        # L_LOC: only on positives
-        box_loss = self.loc_loss(pred_boxes, gt_boxes).mean(-1)  # (B,S,A)
-        LLOC = (box_loss * gt_obj).sum() / (gt_obj.sum() + 1e-6)
+        box_loss = loc_loss(pb, gb).mean(-1)
+        LLOC = (box_loss * go).sum() / (go.sum() + 1e-6)
 
-        # L_CLS: CE for classes + BCE for objectness
-        pos_mask = gt_obj > 0.5
-        if pos_mask.any():
-            cls_loss = self.cls_loss(pred_cls[pos_mask], gt_cls[pos_mask])
-            Lcls_term = cls_loss.mean()
+        if (go > 0.5).any():
+            Lcls = cls_loss(pc[go>0.5], gc[go>0.5]).mean()
         else:
-            Lcls_term = torch.tensor(0.0, device=pred_cls.device)
+            Lcls = torch.tensor(0.0, device=pc.device)
 
-        obj_loss = self.obj_loss(pred_obj, gt_obj.float()).mean()
-        LCLS = Lcls_term + obj_loss
+        Lobj = obj_loss(po, go.float()).mean()
+        return {"LLOC": LLOC, "LCLS": Lcls+Lobj}
 
-        return {"LLOC": LLOC, "LCLS": LCLS, "total": LLOC + LCLS}
 
 class VisualOpinionLearner(nn.Module):
-    def __init__(self, visual_dims=(2048,1536,1024), text_dim=768,
-                 hidden_dim=512, num_heads=8, dropout=0.1, backbone="yolov8n"):
+    def __init__(self, hidden_dim=512, text_dim=768, backbone="resnet50"):
         super().__init__()
-        self.hidden_dim = hidden_dim
-        self.visual_dims = visual_dims
-        self.text_dim = text_dim
-        self.backbone = backbone.lower()
-
-        # project text -> hidden once (registered module)
+        self.backbone = backbone
         self.text_proj = nn.Linear(text_dim, hidden_dim) if text_dim != hidden_dim else nn.Identity()
-
-        # If using feature-level DetectHead, its in_dim must match hidden_dim
-        if backbone.startswith("yolov8"):
-            # keep det_model None or a proper ultralytics model expecting images
-            self.det_model = None
-        elif backbone.startswith("resnet") or backbone.startswith("vit"):
-            self.det_model = nn.ModuleList([DetectHead(in_dim=hidden_dim, hidden_dim=hidden_dim)
-                                            for _ in range(3)])
+        if backbone.startswith("resnet") or backbone.startswith("vit"):
+            self.det_heads = nn.ModuleList([DetectHead(hidden_dim, hidden_dim) for _ in range(3)])
         else:
-            raise ValueError(f"Unsupported backbone for VOL: {backbone}")
+            self.det_heads = None
 
-        # projections
-        self.W_triple_prime = nn.ModuleList([nn.Linear(hidden_dim, hidden_dim) for _ in range(3)]) # Dvi to H
-        self.W_A = nn.ModuleList([nn.Linear(hidden_dim, hidden_dim) for _ in range(3)]) # H_A will have shape (B, Si, H)
-        self.W_alpha = nn.ModuleList([nn.Linear(hidden_dim*2, 1) for _ in range(3)]) # scalar gate per token
-
-        # cross-modal attention
-        self.H_A = nn.ModuleList([
-            CrossModalAttentionBlock(v_dim=hidden_dim, t_dim=hidden_dim, hidden_dim=hidden_dim,
-                                     num_heads=num_heads, dropout=dropout)
-            for _ in range(3)
-        ])
+        self.W_proj = nn.ModuleList([nn.Linear(hidden_dim, hidden_dim) for _ in range(3)])
+        self.WA = nn.ModuleList([nn.Linear(hidden_dim, hidden_dim) for _ in range(3)])
+        self.gates = nn.ModuleList([nn.Linear(hidden_dim*2, 1) for _ in range(3)])
+        self.attn_blocks = nn.ModuleList([CrossModalAttentionBlock(hidden_dim, hidden_dim, hidden_dim) for _ in range(3)])
+        self.loss_fn = VOLLoss()
 
     def forward(self, visuals, text_features, text_mask=None, targets=None):
-        """
-        visuals: list [H'''_V1,H'''_V2,H'''_V3], each (B,Si,Dvi)
-        text_features: (B,T,Dt)
-        targets: ground truth labels for YOLO (list of length B), optional
-        """
-        B = text_features.size(0)
         HT = self.text_proj(text_features)
-        H_hats, total_loc_loss, total_cls_loss = [], 0.0, 0.0
+        H_hats, total_loss = [], None
 
-        # --- detection step ---
-        if targets is not None:
-            if self.backbone in ["resnet", "vit"]:
-                for i, HVi in enumerate(visuals):
-                    preds = self.det_model[i](HVi)  # SimpleDETHead
-                    assigned_targets = self.assign_targets(targets, S=HVi.size(1), A=preds["boxes"].size(2), num_classes=preds["class_logits"].size(-1))
-                    det_loss = VOLLoss()(preds, assigned_targets)
-                    total_loc_loss += det_loss["LLOC"]
-                    total_cls_loss += det_loss["LCLS"]
+        if targets is not None and self.det_heads is not None:
+            total_loss = {"LLOC":0.0, "LCLS":0.0}
+            for i,HVi in enumerate(visuals):
+                preds = self.det_heads[i](self.W_proj[i](HVi))
+                det_loss = self.loss_fn(preds, targets[i])
+                total_loss["LLOC"] += det_loss["LLOC"]
+                total_loss["LCLS"] += det_loss["LCLS"]
 
-            elif self.backbone.startswith("yolov8"):
-                preds = self.det_model.detect(visuals, verbose=False)  # all scales together
-                det_loss = self.det_model.loss(preds, targets)
-                total_loc_loss += det_loss["box"]
-                total_cls_loss += det_loss["cls"] + det_loss["dfl"]
+        for i,HVi in enumerate(visuals):
+            Hv_proj = self.W_proj[i](HVi)
+            Hv_att = self.attn_blocks[i](HVi, HT, text_mask)
+            HvA_proj = self.WA[i](Hv_att)
+            alpha = torch.sigmoid(self.gates[i](torch.cat([Hv_proj, HvA_proj], dim=-1)))
+            H_hats.append(alpha*Hv_proj + (1-alpha)*HvA_proj)
 
-        # --- cross-modal fusion ---
-        for i, HVi in enumerate(visuals):
-            HVi_project = self.W_triple_prime[i](HVi)
-            HVi_A = self.H_A[i](HVi, HT, text_mask)
-            HVi_A_project = self.W_A[i](HVi_A)
+        return H_hats, total_loss
 
-            gate_in = torch.cat([HVi_project, HVi_A_project], dim=-1)
-            alpha = torch.sigmoid(self.W_alpha[i](gate_in))
-
-            HVi_hat = alpha * HVi_project + (1 - alpha) * HVi_A_project
-            H_hats.append(HVi_hat)
-
-        loss = None
-        if targets is not None:
-            loss = {
-                "LLOC": total_loc_loss / len(visuals),
-                "LCLS": total_cls_loss / len(visuals),
-                "total": (total_loc_loss + total_cls_loss) / len(visuals)
-            }
-        return H_hats, loss
-
-    @staticmethod
-    def assign_targets(gt, S, A, device):
-        B = len(gt)
-        grid_size = int(S ** 0.5)
-        boxes = torch.zeros(B, S, A, 4, device=device)
-        obj_mask = torch.zeros(B, S, A, device=device)
-        classes = torch.zeros(B, S, A, dtype=torch.long, device=device)
-
-        for b in range(B):
-            for obj in gt[b]:
-                cls, x, y, w, h = obj
-                gx, gy = x * grid_size, y * grid_size
-                gi = max(0, min(grid_size - 1, int(gx)))
-                gj = max(0, min(grid_size - 1, int(gy)))
-                cell_idx = gj * grid_size + gi
-                boxes[b, cell_idx, 0] = torch.tensor([x, y, w, h], device=device)
-                obj_mask[b, cell_idx, 0] = 1.0
-                classes[b, cell_idx, 0] = int(cls)
-
-        return {"boxes": boxes, "obj_mask": obj_mask, "classes": classes}
-
-# =============================== Multi-modal Sentiment Analyzer =================================
+# =============================== MSA =========================================
 class MultiModalSentimentAnalyzer(nn.Module):
-    """
-    MSA aligned to CORSA eq(11).
-    - Expects H_hats = [H1 (B,49,H), H2 (B,196,H), H3 (B,784,H)]
-    - E: text input embeddings (B, T_text, d_model) from the SAME BART embedding layer
-    - text_mask: (B, T_text) attention mask (1 valid, 0 pad)
-    - decoder_input_ids: (B, T_dec) shifted-right target ids (for teacher forcing)
-    """
-    def __init__(self, llm_model, hidden_dim=512, vocab_size=None):
+    def __init__(self, llm_model, hidden_dim=512):
         super().__init__()
-        # llm_model: a HF seq2seq model (BartForConditionalGeneration or similar)
         self.llm = llm_model
-        self.d_model = self.llm.config.d_model  # target dimension for encoder/decoder
-        if vocab_size is None:
-            vocab_size = self.llm.config.vocab_size
-
-        # WV2: map 196 tokens -> 49 tokens, WV3: map 784 -> 49 (linear across token axis).
-        self.WV2 = nn.Linear(196, 49)   # will be applied to HV2.transpose(1,2)
+        self.d_model = llm_model.config.d_model
+        self.vocab_size = llm_model.config.vocab_size
+        self.WV2 = nn.Linear(196, 49)
         self.WV3 = nn.Linear(784, 49)
-
-        # fuse channel dims and project to d_model
-        self.fuse_proj = nn.Linear(hidden_dim * 3, self.d_model)  # (concatenated channels -> d_model)
-
-        # final token->vocab head
-        self.lm_head = nn.Linear(self.d_model, vocab_size, bias=True)
-
-        # loss
-        self.loss_fn = nn.CrossEntropyLoss(ignore_index=-100)  # -100 default ignore
+        self.fuse_proj = nn.Linear(hidden_dim*3, self.d_model)
+        self.lm_head = nn.Linear(self.d_model, self.vocab_size)
+        self.loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
 
     def forward(self, H_hats, E, text_mask, decoder_input_ids, labels=None):
-        # H_hats: list of tensors with shapes [ (B,49,H), (B,196,H), (B,784,H) ]
         HV1, HV2, HV3 = H_hats
-        B = HV1.size(0)
-
-        # map HV2 (B,196,H) -> (B,49,H)
-        # apply WV2 along token axis: transpose -> (B,H,196) -> linear -> (B,H,49) -> transpose back
-        HV2_49 = self.WV2(HV2.transpose(1,2)).transpose(1,2)  # (B,49,H)
-        HV3_49 = self.WV3(HV3.transpose(1,2)).transpose(1,2)  # (B,49,H)
-
-        # concat channels: (B,49, 3*H)
+        HV2_49 = self.WV2(HV2.transpose(1,2)).transpose(1,2)
+        HV3_49 = self.WV3(HV3.transpose(1,2)).transpose(1,2)
         H_cat = torch.cat([HV1, HV2_49, HV3_49], dim=-1)
-
-        # project channels to d_model => (B,49,d_model)
         H_vis = self.fuse_proj(H_cat)
 
-        # concatenate visual tokens with text embeddings along sequence dimension
-        # E is expected to be (B, T_text, d_model)
-        enc_inputs = torch.cat([H_vis, E], dim=1)  # (B, 49 + T_text, d_model)
+        # Debug prints (optional)
+        # print("H_vis shape:", H_vis.shape)
+        # print("E shape:", E.shape)
+        # print("text_mask shape:", text_mask.shape)
 
-        # build encoder attention mask: 1 for visual tokens (all valid), then original text_mask
-        device = enc_inputs.device
-        vis_mask = torch.ones(B, H_vis.size(1), dtype=torch.long, device=device)
-        enc_attention_mask = torch.cat([vis_mask, text_mask], dim=1)  # (B, 49 + T_text)
+        # Use only text embeddings and mask for BART encoder
+        enc_in = E
+        enc_mask = text_mask
 
-        # call encoder (pass inputs_embeds)
-        encoder_outputs = self.llm.model.encoder(inputs_embeds=enc_inputs,
-                                                 attention_mask=enc_attention_mask,
-                                                 return_dict=True)
-        encoder_hidden = encoder_outputs.last_hidden_state  # (B, seq_len_enc, d_model)
+        enc_out = self.llm.model.encoder(inputs_embeds=enc_in,
+                                         attention_mask=enc_mask,
+                                         return_dict=True)
+        # print("encoder_hidden_state shape:", enc_out.last_hidden_state.shape)
+        # print("decoder_input_ids shape:", decoder_input_ids.shape)
+        # print("labels shape:", labels.shape if labels is not None else None)
 
-        # call decoder with encoder_hidden_states (HuggingFace API)
-        decoder_outputs = self.llm.model.decoder(input_ids=decoder_input_ids,
-                                                 encoder_hidden_states=encoder_hidden,
-                                                 encoder_attention_mask=enc_attention_mask,
-                                                 return_dict=True)
-        decoder_hidden = decoder_outputs.last_hidden_state  # (B, T_dec, d_model)
+        dec_out = self.llm.model.decoder(input_ids=decoder_input_ids,
+                                         encoder_hidden_states=enc_out.last_hidden_state,
+                                         encoder_attention_mask=enc_mask,
+                                         return_dict=True)
 
-        logits = self.lm_head(decoder_hidden)  # (B, T_dec, vocab_size)
+        # FIX: Compute logits from decoder output
+        logits = self.lm_head(dec_out.last_hidden_state)
 
         loss = None
         if labels is not None:
-            # labels: (B, T_dec) with ignore_index=-100 for padded tokens
             loss = self.loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
 
         return logits, loss
+
+
+class CORSA(nn.Module):
+    """
+    Full pipeline: ImageEncoder → CRD → VOL → MSA.
+    Implements joint loss: λ_D * L_CRD + λ_L*(L_LOC+L_CLS) + L_MSA
+    """
+    def __init__(self, backbone="resnet50", text_model="facebook/bart-base",
+                 hidden_dim=512, lambda_D=1.0, lambda_L=1.0):
+        super().__init__()
+        # components
+        self.image_encoder = ImageEncoder(backbone=backbone)
+        self.text_encoder = TextEncoder(model_name=text_model)
+        self.crd = ConditionalRelationDetector(
+            visual_dims=(2048,1536,1024),
+            text_dim=self.text_encoder.hidden_size,
+            hidden_dim=hidden_dim
+        )
+        self.vol = VisualOpinionLearner(hidden_dim=hidden_dim,
+                                        text_dim=self.text_encoder.hidden_size,
+                                        backbone=backbone)
+        self.msa = MultiModalSentimentAnalyzer(self.text_encoder.model,
+                                               hidden_dim=hidden_dim)
+        # loss weights
+        self.lambda_D = lambda_D
+        self.lambda_L = lambda_L
+
+    def forward(self, images, texts, aspects,
+                decoder_input_ids, labels_msa,
+                labels_crd=None, targets_vol=None):
+        """
+        Args:
+            images: tensor (B,3,H,W)
+            texts: list of B strings
+            aspects: list of B strings
+            decoder_input_ids: (B, T_dec)
+            labels_msa: (B, T_dec) sentiment targets
+            labels_crd: (B,3) ground truth relevance labels (optional)
+            targets_vol: list of length B with detection targets (optional)
+        Returns:
+            total_loss, dict of sub-losses, msa_logits
+        """
+        # 1. Encode
+        visuals = self.image_encoder(images)        # [HV1, HV2, HV3]
+        HT, E, mask = self.text_encoder(texts, aspects)
+
+        # 2. CRD
+        crd_logits, crd_probs, filtered_visuals, loss_crd = self.crd(
+            visuals, HT, text_mask=mask, labels_crd=labels_crd
+        )
+
+        # 3. VOL
+        H_hats, loss_vol = self.vol(filtered_visuals, HT, text_mask=mask, targets=targets_vol)
+
+        # 4. MSA
+        msa_logits, loss_msa = self.msa(H_hats, E, mask,
+                                        decoder_input_ids, labels=labels_msa)
+
+        # 5. Aggregate joint loss
+        total_loss = 0.0
+        if loss_crd is not None:
+            total_loss += self.lambda_D * loss_crd
+        if loss_vol is not None:
+            total_loss += self.lambda_L * (loss_vol["LLOC"] + loss_vol["LCLS"])
+        if loss_msa is not None:
+            total_loss += loss_msa
+
+        return total_loss, {
+            "L_CRD": loss_crd,
+            "L_VOL": loss_vol,
+            "L_MSA": loss_msa,
+            "total": total_loss
+        }, msa_logits
+
+
+def build_inputs(image_paths, texts, aspects, sentiments,
+                 text_encoder, num_anchors=3, max_dec_len=10,
+                 device="cuda"):
+    """
+    Build a batch of inputs for CORSA.
+    
+    Args:
+        image_paths: list of image file paths
+        texts: list of text strings
+        aspects: list of aspect strings
+        sentiments: list of sentiment labels (e.g., "positive"/"negative"/"neutral")
+        text_encoder: instance of TextEncoder (to access tokenizer/model)
+        num_anchors: number of anchors per grid cell (default 3)
+        max_dec_len: max decoding length for MSA labels
+        device: "cuda" or "cpu"
+    
+    Returns:
+        images: (B,3,H,W) float tensor
+        texts: list of strings
+        aspects: list of strings
+        labels_crd: (B,3) int tensor
+        targets_vol: list of 3 dicts with detection targets
+        decoder_input_ids: (B,T_dec) int tensor
+        labels_msa: (B,T_dec) int tensor
+    """
+    B = len(image_paths)
+
+    # --- Image preprocessing ---
+    transform = transforms.Compose([
+        transforms.Resize((224,224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485,0.456,0.406],
+                             std=[0.229,0.224,0.225])
+    ])
+    imgs = [transform(Image.open(p).convert("RGB")) for p in image_paths]
+    images = torch.stack(imgs).to(device)
+
+    # --- CRD labels (dummy: all relevant) ---
+    labels_crd = torch.ones(B, 3, dtype=torch.long, device=device)
+
+    # --- VOL targets (dummy: empty detection, matching scales) ---
+    scales = [49, 196, 784]
+    targets_vol = []
+    for S in scales:
+        targets_vol.append({
+            "boxes": torch.zeros(B, S, num_anchors, 4, device=device),
+            "obj_mask": torch.zeros(B, S, num_anchors, device=device),
+            "classes": torch.zeros(B, S, num_anchors, dtype=torch.long, device=device)
+        })
+
+    # --- MSA decoder inputs & labels ---
+    # Convert sentiment into token sequence: e.g., "<aspect> is <sentiment>"
+    target_texts = [f"{a} is {s}" for a,s in zip(aspects, sentiments)]
+    enc = text_encoder.tokenizer(
+        target_texts,
+        padding="max_length", truncation=True, max_length=max_dec_len,
+        return_tensors="pt"
+    )
+    labels_msa = enc["input_ids"].to(device)
+    # decoder inputs are shifted right (standard seq2seq teacher forcing)
+    decoder_input_ids = text_encoder.model.prepare_decoder_input_ids_from_labels(labels_msa)
+
+    return images, texts, aspects, labels_crd, targets_vol, decoder_input_ids, labels_msa
+
+def infer(json_path="demo_data/train_input.json"):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = CORSA(backbone="resnet50", text_model="facebook/bart-base").to(device)
+
+    # === Load JSON dataset ===
+    dataset = []
+    with open(json_path, "r", encoding="utf-8") as f:
+        for line in f:
+            dataset.append(json.loads(line))
+
+    total_losses, all_loss_dicts, all_predictions = [], [], []
+
+    for entry in dataset:
+        num_samples = len(entry["words"])
+        image_paths = [entry["image"]] * num_samples
+        texts = [entry["text"]] * num_samples
+        aspects = entry["words"]
+        sentiments = entry["sentiments"]       # list of true sentiments
+
+        # --- Build inputs ---
+        images, texts, aspects, labels_crd, targets_vol, decoder_input_ids, labels_msa = build_inputs(
+            image_paths, texts, aspects, sentiments, model.text_encoder, device=device
+        )
+
+        # --- Forward pass ---
+        total_loss, losses, logits = model(
+            images, texts, aspects,
+            decoder_input_ids, labels_msa,
+            labels_crd=labels_crd, targets_vol=targets_vol
+        )
+
+        # --- Print CRD relevance scores ---
+        crd_logits, crd_probs, _, _ = model.crd(
+            model.image_encoder(images),
+            model.text_encoder(texts, aspects)[0],
+            text_mask=model.text_encoder(texts, aspects)[2]
+        )
+        print("CRD relevance scores (probs):")
+        print(crd_probs.detach().cpu().numpy())  # shape: (B, 3, 2), last dim: [not relevant, relevant]
+
+        # --- Decode predictions ---
+        pred_ids = torch.argmax(logits, dim=-1)   # (B, T_dec)
+        pred_texts = model.text_encoder.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+
+        predictions = {}
+        for asp, pred in zip(aspects, pred_texts):
+            tokens = pred.strip().split()
+            sentiment = tokens[-1] if len(tokens) >= 3 and tokens[-2] == "is" else "unknown"
+            predictions[asp] = sentiment
+
+        # --- Helper to safely detach nested loss dicts ---
+        def detach_loss(val):
+            if val is None:
+                return None
+            if isinstance(val, dict):
+                return {kk: detach_loss(vv) for kk, vv in val.items()}
+            if torch.is_tensor(val):
+                return float(val.detach().cpu())
+            return float(val)
+
+        loss_dict = {k: detach_loss(v) for k, v in losses.items()}
+
+        # --- Collect results ---
+        total_losses.append(float(total_loss.detach().cpu()))
+        all_loss_dicts.append(loss_dict)
+        all_predictions.append(predictions)
+
+        # --- Print sample results ---
+        print(f"\n=== Sample ===")
+        print("Text:", entry["text"], "Words:", entry["words"])
+        for asp, gt, pred in zip(aspects, entry["sentiments"], predictions.values()):
+            print(f"Aspect: {asp:10s} | GT: {gt:8s} | Pred: {pred}")
+        print("Loss dict:", loss_dict)
+
+    # Return all results
+    return total_losses, all_loss_dicts, all_predictions
+
+def train_and_save(model, train_json, num_epochs=1, save_path="corsa_trained.pt"):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    dataset = []
+    with open(train_json, "r", encoding="utf-8") as f:
+        for line in f:
+            dataset.append(json.loads(line))
+    model.train()
+    for epoch in range(num_epochs):
+        print(f"\n=== Epoch {epoch+1}/{num_epochs} ===")
+        for entry in dataset:
+            num_samples = len(entry["words"])
+            image_paths = [entry["image"]] * num_samples
+            texts = [entry["text"]] * num_samples
+            aspects = entry["words"]
+            sentiments = entry["sentiments"]
+
+                # Print label map for this entry
+            label_map = dict(zip(aspects, sentiments))
+            print("Input label map:", label_map)
+
+            images, texts, aspects, labels_crd, targets_vol, decoder_input_ids, labels_msa = build_inputs(
+                image_paths, texts, aspects, sentiments, model.text_encoder, device=device
+            )
+            optimizer.zero_grad()
+            total_loss, losses, _ = model(
+                images, texts, aspects,
+                decoder_input_ids, labels_msa,
+                labels_crd=labels_crd, targets_vol=targets_vol
+            )
+            total_loss.backward()
+            optimizer.step()
+
+            # Print losses for each batch
+            def detach_loss(val):
+                if val is None:
+                    return None
+                if isinstance(val, dict):
+                    return {kk: detach_loss(vv) for kk, vv in val.items()}
+                if torch.is_tensor(val):
+                    return float(val.detach().cpu())
+                return float(val)
+            loss_dict = {k: detach_loss(v) for k, v in losses.items()}
+            print(f"Batch loss: {loss_dict}")
+
+    torch.save(model.state_dict(), save_path)
+    print(f"Model saved to {save_path}")
+
+def evaluate(model, json_path):
+    model.eval()
+    with torch.no_grad():
+        return infer(json_path)
+
+def run_all_splits():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = CORSA(backbone="resnet50", text_model="facebook/bart-base").to(device)
+    train_and_save(model, "demo_data/train_demo_lite.json", num_epochs=1, save_path="corsa_trained.pt")
+    model.load_state_dict(torch.load("corsa_trained.pt", map_location=device))
+    print("\n=== Evaluating on dev set ===")
+    evaluate(model, "demo_data/dev_demo_lite.json")
+    print("\n=== Evaluating on test set ===")
+    evaluate(model, "demo_data/test_demo_lite.json")
+
+if __name__ == "__main__":
+    run_all_splits()
