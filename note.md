@@ -1,10 +1,44 @@
-# September 13th, 2025
-- CORSA is worked, but the accuracy is very low. Maybe increasing data will gain a higher performance.
-- CORSA aims to predict APSECT and SENTIMENT, however it currently predicts ONLY SENTIMENT -> Need to add NER model.
-- As ASPECT is specific (Hospitality domain), it is necceassary to fine-tune model to get a great NER.
-- CORSA still not use YOLOv8n backbones, maybe this is a root of bad performance.
+{
+    "words": [
+      "And",
+      "this",
+      "is",
+      "proof",
+      "that",
+      "the",
+      "US",
+      "is",
+      "behind",
+      "in",
+      "fashion",
+      ",",
+      "I",
+      "bought",
+      "this",
+      "sweater",
+      "in",
+      "Europe",
+      "last",
+      "winter",
+      "(",
+      "except",
+      "in",
+      "grey",
+      ")"
+    ],
+    "image_id": "15649.jpg",
+    "aspects": [
+      { "from": 6, "to": 7, "polarity": "NEG", "term": ["US"] },
+      { "from": 17, "to": 18, "polarity": "POS", "term": ["Europe"] }
+    ],
+    "opinions": [{ "term": [] }],
+    "caption": "im not a fan of the black t  shirt but i love the black",
+    "image_path": "./data/twitter2015_images/15649.jpg",
+    "aspects_num": 2
+}
 
-# Thêm NOTE
-- Tự tìm model NER
-- Thêm báo cáo mô hình
-- Xử lý vấn đề đa hình ảnh
+Keys:
+- `term`: Term of Twitter Dataset are very various while Hotel Dataset may be use a pair of `(aspect_name, aspect_term)`. E.g.: `("service", "Dang Thanh An")`.
+- In Hotel Dataset, `sentiment` and `aspect` will share a `term` (or `aspect_term` = `sentiment_term`). 
+- Twitter Dataset has only 1 image while Hotel Dataset have multi-images or nothing. -> Need to find a way to concanate them
+- Twitter Dataset has the location of aspect

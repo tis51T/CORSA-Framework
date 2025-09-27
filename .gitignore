@@ -1,5 +1,6 @@
-absa/
 data/
-!data/twitter_data/twitter2017_images/
-note.md
-demo_data/
+!GMP/src/data/
+log/
+__pycache__/
+temp.py
+bart-models/
