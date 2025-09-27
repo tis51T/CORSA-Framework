@@ -1,2 +1,0 @@
-# Seminar
-HCMUS Seminar Repo
